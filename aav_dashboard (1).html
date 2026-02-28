@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AAV · Stop Sign Monitor</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Bebas+Neue&display=swap" rel="stylesheet"/>
+<style>
+  :root {
+    --bg:       #0a0c0f;
+    --panel:    #111418;
+    --border:   #1e2430;
+    --accent:   #e8341a;
+    --safe:     #1adb6e;
+    --dim:      #2a3040;
+    --text:     #c8d0dc;
+    --muted:    #4a5568;
+    --font-mono: 'Share Tech Mono', monospace;
+    --font-head: 'Bebas Neue', sans-serif;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-mono);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  body::after {
+    content: '';
+    position: fixed; inset: 0;
+    background: repeating-linear-gradient(
+      0deg, transparent, transparent 2px,
+      rgba(0,0,0,0.07) 2px, rgba(0,0,0,0.07) 4px
+    );
+    pointer-events: none;
+    z-index: 999;
+  }
+
+  /* ── Header ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    flex-shrink: 0;
+  }
+
+  .logo {
+    font-family: var(--font-head);
+    font-size: 1.8rem;
+    letter-spacing: 0.15em;
+    color: #fff;
+  }
+  .logo span { color: var(--accent); }
+
+  .header-right { display: flex; align-items: center; gap: 20px; }
+
+  .conn-config { display: flex; align-items: center; gap: 8px; }
+  .conn-config input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    padding: 6px 12px;
+    width: 195px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+  .conn-config input:focus { border-color: var(--accent); }
+  .conn-config button {
+    background: var(--accent);
+    border: none; border-radius: 3px;
+    color: #fff;
+    font-family: var(--font-head);
+    font-size: 0.95rem;
+    letter-spacing: 0.08em;
+    padding: 6px 16px;
+    cursor: pointer;
+    transition: opacity 0.2s;
+  }
+  .conn-config button:hover { opacity: 0.82; }
+
+  .header-meta { font-size: 0.68rem; color: var(--muted); text-align: right; line-height: 1.9; }
+  #clock { color: var(--text); }
+
+  /* ── Connection bar ── */
+  .conn-bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 5px 24px;
+    background: #0d1017;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.66rem; color: var(--muted);
+    flex-shrink: 0;
+  }
+  .dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--muted); flex-shrink: 0;
+    transition: background 0.4s;
+  }
+  .dot.connected  { background: var(--safe); box-shadow: 0 0 6px var(--safe); }
+  .dot.connecting { background: #f0b429; box-shadow: 0 0 6px #f0b429; animation: blink 1s infinite; }
+  .dot.error      { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  /* ── Two-column layout ── */
+  main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 360px 1fr;
+    overflow: hidden;
+  }
+
+  /* ══════════════════════════════
+     LEFT PANEL
+  ══════════════════════════════ */
+  .left-panel {
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    padding: 22px 18px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  .sign-card {
+    width: 100%;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 30px 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.3s;
+  }
+  .sign-card::before {
+    content: '';
+    position: absolute; inset: 0;
+    opacity: 0; transition: opacity 0.5s;
+    pointer-events: none; border-radius: 4px;
+  }
+  .sign-card.detected { border-color: var(--accent); animation: pulse-border 0.8s ease-out; }
+  .sign-card.detected::before {
+    background: radial-gradient(ellipse at center, rgba(232,52,26,0.13) 0%, transparent 70%);
+    opacity: 1;
+  }
+  @keyframes pulse-border {
+    0%   { box-shadow: 0 0 0 0 rgba(232,52,26,0.6); }
+    100% { box-shadow: 0 0 0 22px rgba(232,52,26,0); }
+  }
+
+  .stop-sign-svg { width: 118px; height: 118px; transition: filter 0.4s, transform 0.3s; }
+  .stop-sign-svg .octagon { fill: var(--dim); stroke: var(--muted); stroke-width: 3; transition: fill 0.4s, stroke 0.4s; }
+  .stop-sign-svg .sign-text { fill: var(--muted); font-family: var(--font-head); font-size: 36px; letter-spacing: 4px; transition: fill 0.4s; }
+  .stop-sign-svg .white-ring { fill: none; stroke: var(--muted); stroke-width: 4; transition: stroke 0.4s; }
+
+  .sign-card.detected .stop-sign-svg { filter: drop-shadow(0 0 14px rgba(232,52,26,0.7)); transform: scale(1.05); }
+  .sign-card.detected .octagon { fill: var(--accent); stroke: #ff6b55; }
+  .sign-card.detected .sign-text { fill: #fff; }
+  .sign-card.detected .white-ring { stroke: rgba(255,255,255,0.55); }
+
+  .status-label {
+    font-family: var(--font-head);
+    font-size: 2.2rem; letter-spacing: 0.12em;
+    color: var(--muted); transition: color 0.3s;
+  }
+  .sign-card.detected .status-label { color: var(--accent); text-shadow: 0 0 18px rgba(232,52,26,0.5); }
+  .status-sub { font-size: 0.66rem; color: var(--muted); letter-spacing: 0.2em; text-transform: uppercase; }
+  .sign-card.detected .status-sub { color: #e8341a99; }
+
+  .stats-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: 100%; }
+  .stat-box { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 14px 16px; }
+  .stat-label { font-size: 0.6rem; letter-spacing: 0.22em; color: var(--muted); margin-bottom: 5px; text-transform: uppercase; }
+  .stat-value { font-family: var(--font-head); font-size: 1.7rem; color: var(--text); letter-spacing: 0.05em; }
+
+  .log-box { width: 100%; background: var(--panel); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+  .log-header {
+    padding: 8px 14px; border-bottom: 1px solid var(--border);
+    font-size: 0.6rem; letter-spacing: 0.22em; color: var(--muted); text-transform: uppercase;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .log-header button {
+    background: none; border: 1px solid var(--border);
+    color: var(--muted); font-family: var(--font-mono);
+    font-size: 0.56rem; padding: 2px 8px; cursor: pointer;
+    letter-spacing: 0.12em; transition: color 0.2s, border-color 0.2s;
+  }
+  .log-header button:hover { color: var(--text); border-color: var(--text); }
+
+  #log-list {
+    list-style: none; max-height: 130px; overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  }
+  #log-list li {
+    padding: 6px 14px; font-size: 0.66rem; border-bottom: 1px solid #1a1f28;
+    display: flex; justify-content: space-between; align-items: center;
+    animation: slide-in 0.22s ease;
+  }
+  @keyframes slide-in { from{opacity:0;transform:translateX(-5px)} to{opacity:1;transform:translateX(0)} }
+  #log-list li .log-time { color: var(--muted); font-size: 0.6rem; }
+  #log-list li .log-msg  { color: var(--accent); }
+  #log-list li .log-msg.clear { color: var(--safe); }
+  #log-list:empty::after { content:'No events yet'; display:block; padding:12px 14px; font-size:0.66rem; color:var(--muted); }
+
+  /* ══════════════════════════════
+     RIGHT PANEL
+  ══════════════════════════════ */
+  .right-panel { display: flex; flex-direction: column; overflow: hidden; }
+
+  .cam-toggle-bar {
+    display: flex; border-bottom: 1px solid var(--border);
+    background: var(--panel); flex-shrink: 0;
+  }
+  .cam-tab {
+    flex: 1; padding: 10px 0;
+    font-family: var(--font-head);
+    font-size: 1rem; letter-spacing: 0.12em;
+    text-align: center; cursor: pointer;
+    color: var(--muted);
+    background: transparent;
+    border: none; border-right: 1px solid var(--border);
+    position: relative; transition: color 0.2s, background 0.2s;
+  }
+  .cam-tab:last-child { border-right: none; }
+  .cam-tab::after {
+    content: ''; position: absolute;
+    bottom: 0; left: 0; right: 0; height: 2px;
+    background: var(--accent);
+    transform: scaleX(0); transition: transform 0.2s;
+  }
+  .cam-tab.active { color: var(--text); background: rgba(232,52,26,0.05); }
+  .cam-tab.active::after { transform: scaleX(1); }
+  .cam-tab:hover:not(.active) { color: var(--text); }
+
+  /* live dot on tab when detecting */
+  .cam-tab .tab-dot {
+    display: inline-block; width: 6px; height: 6px;
+    border-radius: 50%; background: var(--accent);
+    margin-left: 7px; vertical-align: middle;
+    opacity: 0; transition: opacity 0.3s;
+    box-shadow: 0 0 5px var(--accent);
+    animation: blink 0.8s infinite;
+  }
+  .cam-tab .tab-dot.visible { opacity: 1; }
+
+  /* Camera view */
+  .cam-view {
+    flex: 1; position: relative;
+    background: #06080a;
+    overflow: hidden;
+    display: none;
+  }
+  .cam-view.active { display: block; }
+
+  .cam-view canvas {
+    width: 100%; height: 100%;
+    display: block; object-fit: contain;
+  }
+
+  .cam-placeholder {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 12px; color: var(--muted);
+  }
+  .cam-placeholder .cam-icon { font-size: 2.8rem; opacity: 0.25; }
+  .cam-placeholder .cam-name { font-family: var(--font-head); font-size: 1.3rem; letter-spacing: 0.15em; opacity: 0.35; }
+  .cam-placeholder .cam-status { font-size: 0.65rem; letter-spacing: 0.2em; opacity: 0.3; }
+
+  .bbox-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+  .cam-label-overlay {
+    position: absolute; top: 10px; left: 10px;
+    background: rgba(10,12,15,0.78);
+    border: 1px solid var(--border); border-radius: 3px;
+    padding: 3px 10px; font-size: 0.62rem; letter-spacing: 0.18em;
+    color: var(--muted); pointer-events: none;
+  }
+
+  .det-badge {
+    position: absolute; top: 10px; right: 10px;
+    background: rgba(232,52,26,0.15);
+    border: 1px solid var(--accent); border-radius: 3px;
+    padding: 3px 12px; font-size: 0.7rem; letter-spacing: 0.18em;
+    color: var(--accent); opacity: 0; transition: opacity 0.3s;
+    pointer-events: none; font-family: var(--font-head);
+    animation: blink 0.7s infinite;
+  }
+  .det-badge.visible { opacity: 1; }
+
+  /* ── Footer ── */
+  footer {
+    padding: 8px 24px; border-top: 1px solid var(--border);
+    font-size: 0.6rem; color: var(--muted);
+    display: flex; justify-content: space-between;
+    letter-spacing: 0.1em; flex-shrink: 0;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">AAV<span>.</span>VISION</div>
+  <div class="header-right">
+    <div class="conn-config">
+      <input type="text" id="ip-input" placeholder="Jetson IP  e.g. 192.168.0.100" value="192.168.0.100"/>
+      <button onclick="connect()">CONNECT</button>
+    </div>
+    <div class="header-meta">
+      <div id="clock">--:--:--</div>
+      <div>STOP SIGN MONITOR · ROS2 HUMBLE</div>
+    </div>
+  </div>
+</header>
+
+<div class="conn-bar">
+  <div class="dot" id="conn-dot"></div>
+  <span id="conn-label">DISCONNECTED — enter Jetson IP and click CONNECT</span>
+</div>
+
+<main>
+
+  <!-- ══ LEFT: Detection indicator ══ -->
+  <div class="left-panel">
+
+    <div class="sign-card" id="sign-card">
+      <svg class="stop-sign-svg" viewBox="0 0 160 160" xmlns="http://www.w3.org/2000/svg">
+        <polygon class="octagon"   points="56,10 104,10 150,56 150,104 104,150 56,150 10,104 10,56"/>
+        <polygon class="white-ring" points="60,18 100,18 142,60 142,100 100,142 60,142 18,100 18,60"/>
+        <text class="sign-text" x="80" y="94" text-anchor="middle">STOP</text>
+      </svg>
+      <div class="status-label" id="status-label">CLEAR</div>
+      <div class="status-sub"   id="status-sub">NO STOP SIGN DETECTED</div>
+    </div>
+
+    <div class="stats-row">
+      <div class="stat-box">
+        <div class="stat-label">Total Detections</div>
+        <div class="stat-value" id="total-count">0</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Last Seen</div>
+        <div class="stat-value" id="last-seen" style="font-size:0.9rem;padding-top:8px;">—</div>
+      </div>
+    </div>
+
+    <div class="log-box">
+      <div class="log-header">
+        <span>Event Log</span>
+        <button onclick="clearLog()">CLEAR</button>
+      </div>
+      <ul id="log-list"></ul>
+    </div>
+
+  </div>
+
+  <!-- ══ RIGHT: Camera feed with bounding boxes ══ -->
+  <div class="right-panel">
+
+    <div class="cam-toggle-bar">
+      <button class="cam-tab active" id="tab-cam1" onclick="switchCam('cam1')">
+        CAM 1 <span class="tab-dot" id="dot-cam1"></span>
+      </button>
+      <button class="cam-tab" id="tab-cam2" onclick="switchCam('cam2')">
+        CAM 2 <span class="tab-dot" id="dot-cam2"></span>
+      </button>
+    </div>
+
+    <!-- CAM 1 -->
+    <div class="cam-view active" id="view-cam1">
+      <div class="cam-placeholder" id="placeholder-cam1">
+        <div class="cam-icon">◉</div>
+        <div class="cam-name">CAMERA 1</div>
+        <div class="cam-status">AWAITING CONNECTION</div>
+      </div>
+      <canvas id="canvas-cam1"></canvas>
+      <canvas class="bbox-canvas" id="bbox-cam1"></canvas>
+      <div class="cam-label-overlay">CAM1 · /aav/cam1/image_raw</div>
+      <div class="det-badge" id="badge-cam1">● STOP SIGN</div>
+    </div>
+
+    <!-- CAM 2 -->
+    <div class="cam-view" id="view-cam2">
+      <div class="cam-placeholder" id="placeholder-cam2">
+        <div class="cam-icon">◉</div>
+        <div class="cam-name">CAMERA 2</div>
+        <div class="cam-status">AWAITING CONNECTION</div>
+      </div>
+      <canvas id="canvas-cam2"></canvas>
+      <canvas class="bbox-canvas" id="bbox-cam2"></canvas>
+      <div class="cam-label-overlay">CAM2 · /aav/cam2/image_raw</div>
+      <div class="det-badge" id="badge-cam2">● STOP SIGN</div>
+    </div>
+
+  </div>
+</main>
+
+<footer>
+  <span>TOPICS: /aav/stop_sign_detected · /aav/stop_sign_detections · /aav/cam1/image_raw · /aav/cam2/image_raw</span>
+  <span id="msg-count">MSGS RECEIVED: 0</span>
+</footer>
+
+<script>
+  // ── Clock ──
+  function updateClock() {
+    document.getElementById('clock').textContent =
+      new Date().toLocaleTimeString('en-CA', {hour12:false});
+  }
+  setInterval(updateClock, 1000);
+  updateClock();
+
+  // ── State ──
+  let ws = null;
+  let totalDetections = 0;
+  let msgCount = 0;
+  let currentlyDetected = false;
+  let clearTimer = null;
+  let activeCam = 'cam1';
+
+  const latestDetections = { cam1: [], cam2: [] };
+  const camDims = { cam1:{w:640,h:480}, cam2:{w:640,h:480} };
+
+  const card       = document.getElementById('sign-card');
+  const labelEl    = document.getElementById('status-label');
+  const subEl      = document.getElementById('status-sub');
+  const totalEl    = document.getElementById('total-count');
+  const lastSeenEl = document.getElementById('last-seen');
+  const msgCountEl = document.getElementById('msg-count');
+  const connDot    = document.getElementById('conn-dot');
+  const connLabel  = document.getElementById('conn-label');
+  const logList    = document.getElementById('log-list');
+
+  // ── Camera toggle ──
+  function switchCam(cam) {
+    activeCam = cam;
+    ['cam1','cam2'].forEach(c => {
+      document.getElementById('view-' + c).classList.toggle('active', c === cam);
+      document.getElementById('tab-' + c).classList.toggle('active', c === cam);
+    });
+  }
+
+  // ── Connect ──
+  function connect() {
+    const ip = document.getElementById('ip-input').value.trim();
+    if (!ip) return;
+    if (ws) { try { ws.close(); } catch(e){} }
+
+    setConnState('connecting', `CONNECTING TO ${ip}:9090 …`);
+    ws = new WebSocket(`ws://${ip}:9090`);
+
+    ws.onopen = () => {
+      setConnState('connected', `CONNECTED · ws://${ip}:9090`);
+      subscribeAll();
+    };
+    ws.onclose = () => {
+      setConnState('error', 'CONNECTION LOST — retrying in 5s…');
+      setTimeout(() => connect(), 5000);
+    };
+    ws.onerror = () => setConnState('error', `FAILED TO CONNECT TO ${ip}:9090`);
+    ws.onmessage = (evt) => { try { handleMessage(JSON.parse(evt.data)); } catch(e){} };
+  }
+
+  function subscribeAll() {
+    [
+      { topic:'/aav/stop_sign_detected',  type:'std_msgs/Bool' },
+      { topic:'/aav/stop_sign_detections', type:'vision_msgs/Detection2DArray' },
+      { topic:'/aav/cam1/image_raw',       type:'sensor_msgs/CompressedImage' },
+      { topic:'/aav/cam2/image_raw',       type:'sensor_msgs/CompressedImage' },
+    ].forEach(s => ws.send(JSON.stringify({ op:'subscribe', topic:s.topic, type:s.type })));
+  }
+
+  // ── Message router ──
+  function handleMessage(msg) {
+    if (msg.op !== 'publish') return;
+    msgCount++;
+    msgCountEl.textContent = `MSGS RECEIVED: ${msgCount}`;
+
+    if      (msg.topic === '/aav/stop_sign_detected')   handleDetected(msg.msg.data);
+    else if (msg.topic === '/aav/stop_sign_detections')  handleDetections(msg.msg);
+    else if (msg.topic === '/aav/cam1/image_raw')        handleImage('cam1', msg.msg);
+    else if (msg.topic === '/aav/cam2/image_raw')        handleImage('cam2', msg.msg);
+  }
+
+  // ── Bool: stop sign detected ──
+  function handleDetected(detected) {
+    if (detected && !currentlyDetected) {
+      currentlyDetected = true;
+      totalDetections++;
+      totalEl.textContent = totalDetections;
+      const now = ts();
+      lastSeenEl.textContent = now;
+      card.classList.add('detected');
+      labelEl.textContent = 'STOP SIGN';
+      subEl.textContent   = 'DETECTED';
+      addLog('STOP SIGN DETECTED', now, false);
+    }
+    if (detected) resetClearTimer();
+  }
+
+  function resetClearTimer() {
+    if (clearTimer) clearTimeout(clearTimer);
+    clearTimer = setTimeout(() => {
+      currentlyDetected = false;
+      card.classList.remove('detected');
+      labelEl.textContent = 'CLEAR';
+      subEl.textContent   = 'NO STOP SIGN DETECTED';
+      addLog('CLEAR', ts(), true);
+      ['cam1','cam2'].forEach(c => {
+        clearBBoxes(c);
+        document.getElementById('badge-' + c).classList.remove('visible');
+        document.getElementById('dot-' + c).classList.remove('visible');
+      });
+    }, 2000);
+  }
+
+  // ── Detection2DArray → bounding boxes ──
+  function handleDetections(detMsg) {
+    const dets = [];
+    (detMsg.detections || []).forEach(d => {
+      const cx = d.bbox.center.position.x;
+      const cy = d.bbox.center.position.y;
+      const w  = d.bbox.size_x;
+      const h  = d.bbox.size_y;
+      const conf = (d.results && d.results[0]) ? (d.results[0].hypothesis.score || 0) : 0;
+      dets.push({ x: cx - w/2, y: cy - h/2, w, h, conf });
+    });
+
+    // stop_sign_node connects to cam1 RTSP by default
+    latestDetections.cam1 = dets;
+    drawBBoxes('cam1');
+
+    const hasDets = dets.length > 0;
+    document.getElementById('badge-cam1').classList.toggle('visible', hasDets);
+    document.getElementById('dot-cam1').classList.toggle('visible', hasDets);
+  }
+
+  // ── Compressed image frame ──
+  function handleImage(camId, msg) {
+    document.getElementById('placeholder-' + camId).style.display = 'none';
+
+    const canvas = document.getElementById('canvas-' + camId);
+    const ctx    = canvas.getContext('2d');
+    const img    = new Image();
+
+    img.onload = () => {
+      const container = document.getElementById('view-' + camId);
+      canvas.width  = container.clientWidth  || img.width;
+      canvas.height = container.clientHeight || img.height;
+      camDims[camId] = { w: img.width, h: img.height };
+
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      drawBBoxes(camId);
+    };
+
+    // rosbridge sends compressed image data as base64
+    img.src = 'data:image/jpeg;base64,' + msg.data;
+  }
+
+  // ── Draw bounding boxes ──
+  function drawBBoxes(camId) {
+    const bboxCanvas = document.getElementById('bbox-' + camId);
+    const camCanvas  = document.getElementById('canvas-' + camId);
+    const ctx = bboxCanvas.getContext('2d');
+
+    bboxCanvas.width  = camCanvas.width  || bboxCanvas.clientWidth;
+    bboxCanvas.height = camCanvas.height || bboxCanvas.clientHeight;
+    ctx.clearRect(0, 0, bboxCanvas.width, bboxCanvas.height);
+
+    const dets = latestDetections[camId];
+    if (!dets || dets.length === 0) return;
+
+    const sx = bboxCanvas.width  / (camDims[camId].w || 640);
+    const sy = bboxCanvas.height / (camDims[camId].h || 480);
+
+    dets.forEach(d => {
+      const x = d.x * sx;
+      const y = d.y * sy;
+      const w = d.w * sx;
+      const h = d.h * sy;
+      const conf = (d.conf * 100).toFixed(1);
+      const cs   = Math.min(w, h) * 0.18;
+
+      // Glow rect
+      ctx.shadowColor = '#e8341a';
+      ctx.shadowBlur  = 14;
+      ctx.strokeStyle = 'rgba(232,52,26,0.55)';
+      ctx.lineWidth   = 1.5;
+      ctx.strokeRect(x, y, w, h);
+
+      // Corner brackets
+      ctx.shadowBlur  = 0;
+      ctx.strokeStyle = '#ff6b55';
+      ctx.lineWidth   = 2.5;
+      const corners = [
+        [[x, y+cs],[x,y],[x+cs,y]],          // TL
+        [[x+w-cs,y],[x+w,y],[x+w,y+cs]],     // TR
+        [[x,y+h-cs],[x,y+h],[x+cs,y+h]],     // BL
+        [[x+w-cs,y+h],[x+w,y+h],[x+w,y+h-cs]] // BR
+      ];
+      corners.forEach(pts => {
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0], pts[0][1]);
+        ctx.lineTo(pts[1][0], pts[1][1]);
+        ctx.lineTo(pts[2][0], pts[2][1]);
+        ctx.stroke();
+      });
+
+      // Label background
+      const lblW = 118, lblH = 20;
+      ctx.fillStyle = 'rgba(232,52,26,0.88)';
+      ctx.fillRect(x, y - lblH, lblW, lblH);
+
+      // Label text
+      ctx.fillStyle = '#fff';
+      ctx.font = '11px "Share Tech Mono", monospace';
+      ctx.shadowBlur = 0;
+      ctx.fillText(`STOP SIGN  ${conf}%`, x + 6, y - 5);
+    });
+  }
+
+  function clearBBoxes(camId) {
+    const bc = document.getElementById('bbox-' + camId);
+    bc.getContext('2d').clearRect(0, 0, bc.width, bc.height);
+    latestDetections[camId] = [];
+  }
+
+  // ── Log ──
+  function addLog(msg, time, isClear) {
+    const li = document.createElement('li');
+    li.innerHTML = `<span class="log-msg ${isClear?'clear':''}">${msg}</span><span class="log-time">${time}</span>`;
+    logList.prepend(li);
+    while (logList.children.length > 50) logList.removeChild(logList.lastChild);
+  }
+
+  function clearLog() { logList.innerHTML = ''; }
+
+  function setConnState(state, text) {
+    connDot.className     = 'dot ' + state;
+    connLabel.textContent = text;
+  }
+
+  function ts() {
+    return new Date().toLocaleTimeString('en-CA', {hour12:false});
+  }
+</script>
+</body>
+</html>
