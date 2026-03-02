@@ -1,7 +1,7 @@
 # AAV Camera System
 
 Real-time video streaming and stop sign detection for an Autonomous Vehicle.  
-Runs on **NVIDIA Jetson Orin AGX** + **Raspberry Pi 5**.
+Runs on **NVIDIA Jetson Orin AGX** + **Raspberry Pi 5** (MediaMTX optional) with a separate PC-based dashboard.
 
 ```
 Camera (CSI) → MediaMTX (RTSP :8554) → NvDecDecoder → ROS2
@@ -19,15 +19,17 @@ Camera (CSI) → MediaMTX (RTSP :8554) → NvDecDecoder → ROS2
 
 **Hardware**
 - NVIDIA Jetson Orin AGX (JetPack 6.x)
-- Raspberry Pi 5 (MTX server + dashboard)
+- Raspberry Pi 5 (MTX server, optional)
 - 2× CSI cameras (cam1, cam2)
+- PC/Laptop on same LAN (Dashboard)
 
 **Software**
 - ROS2 Humble, CUDA 12.x, TensorRT 10.x
 - OpenCV 4.x with GStreamer, FFmpeg with `h264_nvv4l2dec`
 
 ```bash
-sudo apt install ros-humble-vision-msgs ros-humble-cv-bridge \
+sudo apt update
+sudo apt install -y ros-humble-vision-msgs ros-humble-cv-bridge \
     ros-humble-image-transport ros-humble-compressed-image-transport
 ```
 
@@ -110,8 +112,8 @@ ros2 launch camera_decode multi_camera.launch.py show_window:=true
 
 | Topic | Type | Description |
 |---|---|---|
-| `/aav/cam1/image_raw` | `sensor_msgs/Image` | Decoded frames from cam1 |
-| `/aav/cam2/image_raw` | `sensor_msgs/Image` | Decoded frames from cam2 |
+| `/camera/cam1/image_raw` | `sensor_msgs/Image` | Decoded frames from cam1 |
+| `/camera/cam2/image_raw` | `sensor_msgs/Image` | Decoded frames from cam2 |
 | `/aav/stop_sign_detected` | `std_msgs/Bool` | True when stop sign detected |
 | `/aav/stop_sign_confidence` | `std_msgs/Float32` | Detection confidence score |
 | `/aav/stop_sign_detections` | `vision_msgs/Detection2DArray` | Bounding boxes + metadata |
@@ -120,27 +122,43 @@ ros2 launch camera_decode multi_camera.launch.py show_window:=true
 
 ## Dashboard UI
 
-Web-based monitor for a separate device (e.g. Raspberry Pi) on the same network.
+Web-based monitor for a separate device (PC/Laptop) on the same network.
 
-**Setup on Jetson:**
+This dashboard **does not use rosbridge**.  
+A lightweight Python bridge node subscribes directly to ROS2 topics and serves:
+- HTTP dashboard on `:8080`
+- WebSocket stream on `:9090`
+
+**Setup on PC/Laptop:**
 ```bash
-sudo apt install ros-humble-rosbridge-suite
-ros2 launch rosbridge_server rosbridge_websocket_launch.xml
+sudo apt update
+sudo apt install -y ros-humble-vision-msgs ros-humble-cv-bridge python3-pip
+pip3 install websockets opencv-python numpy
 ```
 
-Open `aav_dashboard.html` in a browser, enter the Jetson IP, and connect.  
-Shows live camera feed (cam1/cam2 toggle), bounding boxes, detection indicator, and event log.
+**Run on PC/Laptop:**
+```bash
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=10
+export ROS_LOCALHOST_ONLY=0
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+python3 dashboard_node.py
+```
+
+Open `http://localhost:8080` in a browser.  
+Shows live camera feed (cam1/cam2), bounding boxes, detection indicator, and confidence value.
 
 ---
 
 ## Debugging
 
 ```bash
-ros2 topic list                          # List active topics
-ros2 topic hz /aav/cam1/image_raw        # Check frame rate
-ros2 topic echo /aav/stop_sign_detected  # Monitor detections
-ros2 topic bw /aav/cam1/image_raw        # Check bandwidth
-sudo iftop -i eno1 -f "port 8554"        # RTSP network usage
+ros2 topic list                              # List active topics
+ros2 topic hz /camera/cam1/image_raw         # Check frame rate
+ros2 topic echo /aav/stop_sign_detected      # Monitor detections
+ros2 topic bw /camera/cam1/image_raw         # Check bandwidth
+sudo iftop -i eno1 -f "port 8554"            # RTSP network usage
 ```
 
 ---
@@ -153,4 +171,4 @@ sudo iftop -i eno1 -f "port 8554"        # RTSP network usage
 | Camera not starting | Check `cameras.yaml` for correct Raspberry Pi IP |
 | Engine fails to load | Rebuild `best.engine` on this Jetson — not cross-device portable |
 | RTSP stream not found | Confirm MediaMTX is running on Pi, port 8554 |
-| Dashboard won't connect | Confirm rosbridge is running on Jetson, port 9090 reachable |
+| Dashboard won't connect | Ensure same LAN + same `ROS_DOMAIN_ID`; verify ports 8080/9090 are reachable |
