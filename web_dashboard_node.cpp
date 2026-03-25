@@ -1,17 +1,21 @@
 /**
  * web_dashboard_node.cpp
  *
- * Lightweight ROS2 node that subscribes to existing /aav topics and serves
+ * Lightweight ROS2 node that subscribes to existing topics and serves
  * a live web dashboard over HTTP — no rosbridge, no extra dependencies.
  *
  * Endpoints:
- *   http://<JETSON_IP>:8080/        → dashboard HTML
- *   http://<JETSON_IP>:8080/cam1    → MJPEG live stream (cam1 with bboxes)
- *   http://<JETSON_IP>:8080/cam2    → MJPEG live stream (cam2)
+ *   http://<JETSON_IP>:8080/          → dashboard HTML
+ *   http://<JETSON_IP>:8080/cam1      → MJPEG live stream (cam1 with bboxes)
+ *   http://<JETSON_IP>:8080/cam2      → MJPEG live stream (cam2)
  *   http://<JETSON_IP>:8080/detections → JSON detection state
  *
- * Build: add to camera_decode CMakeLists.txt as a new executable
- * Run:   ros2 run camera_decode web_dashboard_node
+ * Notes:
+ *   - Bounding boxes are only drawn on CAM1 because the stop-sign detections
+ *     currently come from CAM1.
+ *   - Camera topics fixed to:
+ *       /camera/cam1/image_raw
+ *       /camera/cam2/image_raw
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -25,12 +29,12 @@
 
 #include <thread>
 #include <mutex>
-#include <atomic>
 #include <vector>
 #include <string>
 #include <sstream>
 #include <chrono>
 #include <cstring>
+#include <algorithm>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -39,34 +43,48 @@
 using namespace std::chrono_literals;
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
-static constexpr int  HTTP_PORT    = 8080;
-static constexpr int  JPEG_QUALITY = 60;   // 30–80, lower = less CPU
-static constexpr int  STREAM_FPS   = 15;   // reduce to save CPU
+static constexpr int HTTP_PORT    = 8080;
+static constexpr int JPEG_QUALITY = 60;
+static constexpr int STREAM_FPS   = 15;
 
 // ── Shared frame buffers ──────────────────────────────────────────────────────
 struct FrameBuffer {
-    std::mutex           mtx;
-    std::vector<uchar>   jpeg;
-    bool                 ready = false;
+    std::mutex         mtx;
+    std::vector<uchar> jpeg;
+    bool               ready = false;
 };
 
 static FrameBuffer g_cam1;
 static FrameBuffer g_cam2;
 
-// ── Shared detection state ────────────────────────────────────────────────────
-struct DetectionState {
-    std::mutex mtx;
-    bool  detected   = false;
-    float confidence = 0.0f;
+// ── Detection state ───────────────────────────────────────────────────────────
+// Keep overall detection state for the dashboard card / JSON endpoint,
+// but keep boxes separate per camera so overlays do not bleed across feeds.
+struct BBox {
+    float x{};
+    float y{};
+    float w{};
+    float h{};
+    float conf{};
+};
 
-    struct BBox { float x, y, w, h, conf; };
+struct DetectionOverlay {
+    std::mutex mtx;
     std::vector<BBox> boxes;
 };
 
-static DetectionState g_det;
+struct DetectionSummary {
+    std::mutex mtx;
+    bool  detected   = false;
+    float confidence = 0.0f;
+};
+
+static DetectionSummary g_det_summary;
+static DetectionOverlay g_det_cam1;
+static DetectionOverlay g_det_cam2;  // currently unused / kept empty
 
 // ── Draw bounding boxes onto frame ────────────────────────────────────────────
-static void draw_boxes(cv::Mat& frame, const std::vector<DetectionState::BBox>& boxes)
+static void draw_boxes(cv::Mat& frame, const std::vector<BBox>& boxes)
 {
     const cv::Scalar BOX_COLOR(50, 52, 232);
     const cv::Scalar LABEL_BG (50, 52, 232);
@@ -89,21 +107,25 @@ static void draw_boxes(cv::Mat& frame, const std::vector<DetectionState::BBox>& 
         cv::rectangle(frame, r, BOX_COLOR, 2);
 
         int cl = std::min(20, std::min(r.width, r.height) / 3);
-        cv::line(frame, r.tl(),               {r.x+cl, r.y},             BOX_COLOR, 3);
-        cv::line(frame, r.tl(),               {r.x, r.y+cl},             BOX_COLOR, 3);
-        cv::line(frame, {r.x+r.width, r.y},   {r.x+r.width-cl, r.y},    BOX_COLOR, 3);
-        cv::line(frame, {r.x+r.width, r.y},   {r.x+r.width, r.y+cl},    BOX_COLOR, 3);
-        cv::line(frame, {r.x, r.y+r.height},  {r.x+cl, r.y+r.height},   BOX_COLOR, 3);
-        cv::line(frame, {r.x, r.y+r.height},  {r.x, r.y+r.height-cl},   BOX_COLOR, 3);
-        cv::line(frame, r.br(),               {r.x+r.width-cl, r.y+r.height}, BOX_COLOR, 3);
-        cv::line(frame, r.br(),               {r.x+r.width, r.y+r.height-cl}, BOX_COLOR, 3);
+        cv::line(frame, r.tl(),              {r.x + cl, r.y},               BOX_COLOR, 3);
+        cv::line(frame, r.tl(),              {r.x, r.y + cl},               BOX_COLOR, 3);
+        cv::line(frame, {r.x + r.width, r.y},{r.x + r.width - cl, r.y},    BOX_COLOR, 3);
+        cv::line(frame, {r.x + r.width, r.y},{r.x + r.width, r.y + cl},    BOX_COLOR, 3);
+        cv::line(frame, {r.x, r.y + r.height},{r.x + cl, r.y + r.height},  BOX_COLOR, 3);
+        cv::line(frame, {r.x, r.y + r.height},{r.x, r.y + r.height - cl},  BOX_COLOR, 3);
+        cv::line(frame, r.br(),              {r.x + r.width - cl, r.y + r.height}, BOX_COLOR, 3);
+        cv::line(frame, r.br(),              {r.x + r.width, r.y + r.height - cl}, BOX_COLOR, 3);
 
-        std::string label = "STOP  " + std::to_string((int)(b.conf * 100)) + "%";
+        std::string label = "STOP  " + std::to_string(static_cast<int>(b.conf * 100.0f)) + "%";
         int baseline = 0;
         cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.55, 1, &baseline);
         cv::Point lp(r.x, std::max(r.y - 6, ts.height + 4));
-        cv::rectangle(frame, lp + cv::Point(0, -ts.height - 4),
-                      lp + cv::Point(ts.width + 8, baseline), LABEL_BG, cv::FILLED);
+
+        cv::rectangle(frame,
+                      lp + cv::Point(0, -ts.height - 4),
+                      lp + cv::Point(ts.width + 8, baseline),
+                      LABEL_BG, cv::FILLED);
+
         cv::putText(frame, label, lp + cv::Point(4, 0),
                     cv::FONT_HERSHEY_SIMPLEX, 0.55, LABEL_FG, 1, cv::LINE_AA);
     }
@@ -118,6 +140,7 @@ static void encode_and_store(FrameBuffer& buf, cv::Mat& frame)
 {
     std::vector<uchar> jpeg;
     cv::imencode(".jpg", frame, jpeg, {cv::IMWRITE_JPEG_QUALITY, JPEG_QUALITY});
+
     std::lock_guard<std::mutex> lk(buf.mtx);
     buf.jpeg  = std::move(jpeg);
     buf.ready = true;
@@ -228,7 +251,6 @@ static const char* DASHBOARD_HTML = R"HTML(
   .tab.active{color:var(--text);background:rgba(232,52,26,.05)}
   .tab.active::after{transform:scaleX(1)}
 
-  /* Canvas-based camera view — no <img> flickering */
   .cv{flex:1;background:#06080a;overflow:hidden;display:none;position:relative}
   .cv.active{display:flex;align-items:center;justify-content:center}
   .cv canvas{width:100%;height:100%;object-fit:contain;display:block}
@@ -318,26 +340,23 @@ static const char* DASHBOARD_HTML = R"HTML(
 </footer>
 
 <script>
-  // ── Clock ──
-  setInterval(()=>{
+  setInterval(() => {
     document.getElementById('clock').textContent =
-      new Date().toLocaleTimeString('en-CA',{hour12:false})
+      new Date().toLocaleTimeString('en-CA', {hour12:false})
   }, 1000)
 
-  // ── Camera toggle ──
   function sw(cam) {
-    ['cam1','cam2'].forEach((c,i)=>{
-      document.getElementById('v'+(i+1)).classList.toggle('active', c===cam)
-      document.getElementById('t'+(i+1)).classList.toggle('active', c===cam)
+    ['cam1','cam2'].forEach((c, i) => {
+      document.getElementById('v' + (i + 1)).classList.toggle('active', c === cam)
+      document.getElementById('t' + (i + 1)).classList.toggle('active', c === cam)
     })
   }
 
-  // ── Status indicator — set once, never flicker ────────────────────────────
   let streamLive = false
   let totalFrames = 0
 
   function setLive() {
-    if (streamLive) return          // only update once — prevents toggling
+    if (streamLive) return
     streamLive = true
     document.getElementById('sd').className = 'dot live'
     document.getElementById('sl').textContent = 'LIVE · MJPEG STREAM ACTIVE'
@@ -346,25 +365,18 @@ static const char* DASHBOARD_HTML = R"HTML(
   }
 
   function setError(msg) {
-    // Only show error if we've never gone live — don't interrupt an active stream
     if (!streamLive) {
       document.getElementById('sd').className = 'dot err'
       document.getElementById('sl').textContent = msg
     }
   }
 
-  // ── MJPEG → Canvas renderer ───────────────────────────────────────────────
-  // Replaces <img src="/camX"> which fires onload on EVERY frame causing
-  // the status bar to flicker. Instead we fetch the stream manually,
-  // scan for JPEG SOI/EOI markers, decode each blob via createObjectURL,
-  // draw to canvas, then immediately revoke. Full control, zero flicker.
-
   async function startMjpegStream(url, canvasId, placeholderId) {
     const canvas = document.getElementById(canvasId)
     const ctx    = canvas.getContext('2d')
     const ph     = document.getElementById(placeholderId)
 
-    while (true) {   // outer loop = auto-reconnect
+    while (true) {
       try {
         const resp = await fetch(url)
         if (!resp.ok || !resp.body) throw new Error('bad response')
@@ -376,78 +388,72 @@ static const char* DASHBOARD_HTML = R"HTML(
           const {value, done} = await reader.read()
           if (done) break
 
-          // Append chunk to buffer
           const tmp = new Uint8Array(buf.length + value.length)
           tmp.set(buf)
           tmp.set(value, buf.length)
           buf = tmp
 
-          // Extract all complete JPEGs from buffer using SOI/EOI markers
           while (true) {
-            // Find JPEG SOI (0xFF 0xD8)
             let soi = -1
             for (let i = 0; i < buf.length - 1; i++) {
-              if (buf[i] === 0xFF && buf[i+1] === 0xD8) { soi = i; break }
+              if (buf[i] === 0xFF && buf[i + 1] === 0xD8) { soi = i; break }
             }
             if (soi === -1) break
 
-            // Find JPEG EOI (0xFF 0xD9)
             let eoi = -1
             for (let i = soi + 2; i < buf.length - 1; i++) {
-              if (buf[i] === 0xFF && buf[i+1] === 0xD9) { eoi = i + 1; break }
+              if (buf[i] === 0xFF && buf[i + 1] === 0xD9) { eoi = i + 1; break }
             }
-            if (eoi === -1) break   // incomplete JPEG — wait for more data
+            if (eoi === -1) break
 
-            // Extract the complete JPEG
             const jpeg = buf.slice(soi, eoi + 1)
             buf = buf.slice(eoi + 1)
 
-            // Decode and draw via blob URL (fast, no base64 overhead)
             const blob   = new Blob([jpeg], {type: 'image/jpeg'})
             const objUrl = URL.createObjectURL(blob)
             const img    = new Image()
 
             img.onload = () => {
-              // Size canvas to container on first frame only
               const container = canvas.parentElement
-              if (canvas.width !== container.clientWidth) {
+              if (canvas.width !== container.clientWidth || canvas.height !== container.clientHeight) {
                 canvas.width  = container.clientWidth
                 canvas.height = container.clientHeight
               }
               ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
-              URL.revokeObjectURL(objUrl)   // free memory immediately
+              URL.revokeObjectURL(objUrl)
 
-              ph.classList.add('hidden')    // hide placeholder
-              setLive()                     // mark stream as live (once only)
+              ph.classList.add('hidden')
+              setLive()
 
               totalFrames++
               document.getElementById('fc').textContent = 'FRAMES: ' + totalFrames
             }
+
             img.onerror = () => URL.revokeObjectURL(objUrl)
             img.src = objUrl
           }
         }
-      } catch(e) {
+      } catch (e) {
         setError('STREAM ERROR — retrying in 2s…')
       }
 
-      await new Promise(r => setTimeout(r, 2000))  // wait before reconnecting
+      await new Promise(r => setTimeout(r, 2000))
     }
   }
 
-  // Start both streams independently
   startMjpegStream('/cam1', 'c1', 'ph1')
   startMjpegStream('/cam2', 'c2', 'ph2')
 
-  // ── Detection polling (5 Hz) ──────────────────────────────────────────────
-  let total = 0, active = false, clearTimer = null
+  let total = 0
+  let active = false
+  let clearTimer = null
 
   async function poll() {
     try {
       const r = await fetch('/detections')
       const d = await r.json()
       update(d.detected)
-    } catch(e) {}
+    } catch (e) {}
     setTimeout(poll, 200)
   }
   poll()
@@ -457,36 +463,37 @@ static const char* DASHBOARD_HTML = R"HTML(
     const stl = document.getElementById('stl')
     const sts = document.getElementById('sts')
 
+    // Detection belongs to CAM1 only.
     document.getElementById('b1').classList.toggle('on', det)
-    document.getElementById('b2').classList.toggle('on', det)
+    document.getElementById('b2').classList.remove('on')
 
     if (det && !active) {
       active = true
       total++
       document.getElementById('tc').textContent = total
-      const now = new Date().toLocaleTimeString('en-CA',{hour12:false})
+      const now = new Date().toLocaleTimeString('en-CA', {hour12:false})
       document.getElementById('ls').textContent = now
       sc.classList.add('det')
       stl.textContent = 'STOP SIGN'
       sts.textContent = 'DETECTED'
-      addLog('STOP SIGN DETECTED', now, false)
+      addLog('STOP SIGN DETECTED (CAM1)', now, false)
     }
 
     if (det) {
       if (clearTimer) clearTimeout(clearTimer)
-      clearTimer = setTimeout(()=>{
+      clearTimer = setTimeout(() => {
         active = false
         sc.classList.remove('det')
         stl.textContent = 'CLEAR'
         sts.textContent = 'NO STOP SIGN DETECTED'
-        addLog('CLEAR', new Date().toLocaleTimeString('en-CA',{hour12:false}), true)
+        addLog('CLEAR', new Date().toLocaleTimeString('en-CA', {hour12:false}), true)
       }, 2000)
     }
   }
 
   function addLog(msg, time, clear) {
     const li = document.createElement('li')
-    li.innerHTML = `<span class="m ${clear?'c':''}">${msg}</span><span class="t">${time}</span>`
+    li.innerHTML = `<span class="m ${clear ? 'c' : ''}">${msg}</span><span class="t">${time}</span>`
     const l = document.getElementById('ll')
     l.prepend(li)
     while (l.children.length > 50) l.removeChild(l.lastChild)
@@ -500,16 +507,16 @@ static const char* DASHBOARD_HTML = R"HTML(
 static std::string read_request(int fd)
 {
     char buf[1024] = {};
-    recv(fd, buf, sizeof(buf)-1, 0);
+    recv(fd, buf, sizeof(buf) - 1, 0);
     return std::string(buf);
 }
 
 static std::string parse_path(const std::string& req)
 {
     auto p1 = req.find(' ');
-    auto p2 = req.find(' ', p1+1);
+    auto p2 = req.find(' ', p1 + 1);
     if (p1 == std::string::npos || p2 == std::string::npos) return "/";
-    return req.substr(p1+1, p2-p1-1);
+    return req.substr(p1 + 1, p2 - p1 - 1);
 }
 
 static void send_str(int fd, const std::string& status,
@@ -520,27 +527,30 @@ static void send_str(int fd, const std::string& status,
        << "Content-Type: " << ctype << "\r\n"
        << "Content-Length: " << body.size() << "\r\n"
        << "Access-Control-Allow-Origin: *\r\n"
-       << "Connection: close\r\n\r\n" << body;
-    auto s = ss.str();
+       << "Connection: close\r\n\r\n"
+       << body;
+
+    const auto s = ss.str();
     send(fd, s.c_str(), s.size(), 0);
 }
 
 // ── MJPEG stream per-connection ───────────────────────────────────────────────
 static void serve_mjpeg(int fd, FrameBuffer& buf)
 {
-    // Named boundary so the JS SOI/EOI scanner has clean JPEG data to work with
     const char* hdr =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: multipart/x-mixed-replace; boundary=--aavframe\r\n"
         "Cache-Control: no-cache\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Connection: keep-alive\r\n\r\n";
+
     send(fd, hdr, strlen(hdr), 0);
 
     const int delay_ms = 1000 / STREAM_FPS;
 
     while (true) {
         std::vector<uchar> frame;
+
         {
             std::lock_guard<std::mutex> lk(buf.mtx);
             if (!buf.ready) {
@@ -554,15 +564,15 @@ static void serve_mjpeg(int fd, FrameBuffer& buf)
         ph << "--aavframe\r\n"
            << "Content-Type: image/jpeg\r\n"
            << "Content-Length: " << frame.size() << "\r\n\r\n";
-        auto phs = ph.str();
+        const auto phs = ph.str();
 
         if (send(fd, phs.c_str(), phs.size(), MSG_NOSIGNAL) < 0) break;
-        if (send(fd, reinterpret_cast<const char*>(frame.data()),
-                 frame.size(), MSG_NOSIGNAL) < 0) break;
+        if (send(fd, reinterpret_cast<const char*>(frame.data()), frame.size(), MSG_NOSIGNAL) < 0) break;
         if (send(fd, "\r\n", 2, MSG_NOSIGNAL) < 0) break;
 
         std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
     }
+
     close(fd);
 }
 
@@ -577,6 +587,7 @@ static void http_server()
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(HTTP_PORT);
+
     bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
     listen(srv, 16);
 
@@ -592,11 +603,20 @@ static void http_server()
             } else if (path == "/cam2") {
                 serve_mjpeg(client, g_cam2);
             } else if (path == "/detections") {
-                std::lock_guard<std::mutex> lk(g_det.mtx);
+                bool detected = false;
+                float confidence = 0.0f;
+
+                {
+                    std::lock_guard<std::mutex> lk(g_det_summary.mtx);
+                    detected   = g_det_summary.detected;
+                    confidence = g_det_summary.confidence;
+                }
+
                 std::string json =
                     std::string("{\"detected\":") +
-                    (g_det.detected ? "true" : "false") +
-                    ",\"confidence\":" + std::to_string(g_det.confidence) + "}";
+                    (detected ? "true" : "false") +
+                    ",\"confidence\":" + std::to_string(confidence) + "}";
+
                 send_str(client, "200 OK", "application/json", json);
                 close(client);
             } else {
@@ -616,46 +636,56 @@ public:
         sub_detected_ = create_subscription<std_msgs::msg::Bool>(
             "/aav/stop_sign_detected", 10,
             [this](const std_msgs::msg::Bool::SharedPtr msg) {
-                std::lock_guard<std::mutex> lk(g_det.mtx);
-                g_det.detected = msg->data;
+                std::lock_guard<std::mutex> lk(g_det_summary.mtx);
+                g_det_summary.detected = msg->data;
             });
 
         sub_confidence_ = create_subscription<std_msgs::msg::Float32>(
             "/aav/stop_sign_confidence", 10,
             [this](const std_msgs::msg::Float32::SharedPtr msg) {
-                std::lock_guard<std::mutex> lk(g_det.mtx);
-                g_det.confidence = msg->data;
+                std::lock_guard<std::mutex> lk(g_det_summary.mtx);
+                g_det_summary.confidence = msg->data;
             });
 
         sub_detections_ = create_subscription<vision_msgs::msg::Detection2DArray>(
             "/aav/stop_sign_detections", 10,
             [this](const vision_msgs::msg::Detection2DArray::SharedPtr msg) {
-                std::vector<DetectionState::BBox> boxes;
+                std::vector<BBox> cam1_boxes;
+
                 for (const auto& d : msg->detections) {
-                    DetectionState::BBox b;
+                    BBox b;
                     b.x    = d.bbox.center.position.x - d.bbox.size_x / 2.0f;
                     b.y    = d.bbox.center.position.y - d.bbox.size_y / 2.0f;
                     b.w    = d.bbox.size_x;
                     b.h    = d.bbox.size_y;
                     b.conf = d.results.empty() ? 0.0f : d.results[0].hypothesis.score;
-                    boxes.push_back(b);
+                    cam1_boxes.push_back(b);
                 }
-                std::lock_guard<std::mutex> lk(g_det.mtx);
-                g_det.boxes = std::move(boxes);
+
+                {
+                    std::lock_guard<std::mutex> lk(g_det_cam1.mtx);
+                    g_det_cam1.boxes = std::move(cam1_boxes);
+                }
+
+                // Clear CAM2 overlays so stale/shared boxes never appear there.
+                {
+                    std::lock_guard<std::mutex> lk(g_det_cam2.mtx);
+                    g_det_cam2.boxes.clear();
+                }
             });
 
         auto qos = rclcpp::SensorDataQoS();
 
         sub_cam1_ = create_subscription<sensor_msgs::msg::Image>(
-            "/aav/cam1/image_raw", qos,
+            "/camera/cam1/image_raw", qos,
             [this](const sensor_msgs::msg::Image::SharedPtr msg) {
-                process_frame(msg, g_cam1);
+                process_frame(msg, g_cam1, g_det_cam1);
             });
 
         sub_cam2_ = create_subscription<sensor_msgs::msg::Image>(
-            "/aav/cam2/image_raw", qos,
+            "/camera/cam2/image_raw", qos,
             [this](const sensor_msgs::msg::Image::SharedPtr msg) {
-                process_frame(msg, g_cam2);
+                process_frame(msg, g_cam2, g_det_cam2);
             });
 
         http_thread_ = std::thread(http_server);
@@ -663,18 +693,25 @@ public:
 
         RCLCPP_INFO(get_logger(),
             "Web dashboard running at http://<JETSON_IP>:%d", HTTP_PORT);
+        RCLCPP_INFO(get_logger(),
+            "Subscribed camera topics: /camera/cam1/image_raw and /camera/cam2/image_raw");
     }
 
 private:
     void process_frame(const sensor_msgs::msg::Image::SharedPtr& msg,
-                       FrameBuffer& buf)
+                       FrameBuffer& buf,
+                       DetectionOverlay& det_overlay)
     {
         try {
             cv::Mat frame = cv_bridge::toCvShare(msg, "bgr8")->image.clone();
+
+            std::vector<BBox> boxes_copy;
             {
-                std::lock_guard<std::mutex> lk(g_det.mtx);
-                draw_boxes(frame, g_det.boxes);
+                std::lock_guard<std::mutex> lk(det_overlay.mtx);
+                boxes_copy = det_overlay.boxes;
             }
+
+            draw_boxes(frame, boxes_copy);
             encode_and_store(buf, frame);
         } catch (const cv_bridge::Exception& e) {
             RCLCPP_WARN(get_logger(), "cv_bridge error: %s", e.what());
