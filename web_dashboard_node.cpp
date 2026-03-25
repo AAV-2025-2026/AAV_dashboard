@@ -59,7 +59,6 @@ struct DetectionState {
     bool  detected   = false;
     float confidence = 0.0f;
 
-    // Latest bboxes for drawing — stored until next detection message
     struct BBox { float x, y, w, h, conf; };
     std::vector<BBox> boxes;
 };
@@ -69,7 +68,7 @@ static DetectionState g_det;
 // ── Draw bounding boxes onto frame ────────────────────────────────────────────
 static void draw_boxes(cv::Mat& frame, const std::vector<DetectionState::BBox>& boxes)
 {
-    const cv::Scalar BOX_COLOR(50, 52, 232);   // BGR red
+    const cv::Scalar BOX_COLOR(50, 52, 232);
     const cv::Scalar LABEL_BG (50, 52, 232);
     const cv::Scalar LABEL_FG (255, 255, 255);
 
@@ -81,34 +80,24 @@ static void draw_boxes(cv::Mat& frame, const std::vector<DetectionState::BBox>& 
             static_cast<int>(b.h)
         );
 
-        // Clip to frame bounds
         r &= cv::Rect(0, 0, frame.cols, frame.rows);
         if (r.empty()) continue;
 
-        // Semi-transparent fill
         cv::Mat overlay = frame.clone();
         cv::rectangle(overlay, r, BOX_COLOR, cv::FILLED);
         cv::addWeighted(overlay, 0.12, frame, 0.88, 0, frame);
-
-        // Outline
         cv::rectangle(frame, r, BOX_COLOR, 2);
 
-        // Corner brackets
         int cl = std::min(20, std::min(r.width, r.height) / 3);
-        // TL
-        cv::line(frame, r.tl(), {r.x+cl, r.y},             BOX_COLOR, 3);
-        cv::line(frame, r.tl(), {r.x, r.y+cl},              BOX_COLOR, 3);
-        // TR
-        cv::line(frame, {r.x+r.width, r.y}, {r.x+r.width-cl, r.y},  BOX_COLOR, 3);
-        cv::line(frame, {r.x+r.width, r.y}, {r.x+r.width, r.y+cl},  BOX_COLOR, 3);
-        // BL
-        cv::line(frame, {r.x, r.y+r.height}, {r.x+cl, r.y+r.height},BOX_COLOR, 3);
-        cv::line(frame, {r.x, r.y+r.height}, {r.x, r.y+r.height-cl},BOX_COLOR, 3);
-        // BR
-        cv::line(frame, r.br(), {r.x+r.width-cl, r.y+r.height}, BOX_COLOR, 3);
-        cv::line(frame, r.br(), {r.x+r.width, r.y+r.height-cl}, BOX_COLOR, 3);
+        cv::line(frame, r.tl(),               {r.x+cl, r.y},             BOX_COLOR, 3);
+        cv::line(frame, r.tl(),               {r.x, r.y+cl},             BOX_COLOR, 3);
+        cv::line(frame, {r.x+r.width, r.y},   {r.x+r.width-cl, r.y},    BOX_COLOR, 3);
+        cv::line(frame, {r.x+r.width, r.y},   {r.x+r.width, r.y+cl},    BOX_COLOR, 3);
+        cv::line(frame, {r.x, r.y+r.height},  {r.x+cl, r.y+r.height},   BOX_COLOR, 3);
+        cv::line(frame, {r.x, r.y+r.height},  {r.x, r.y+r.height-cl},   BOX_COLOR, 3);
+        cv::line(frame, r.br(),               {r.x+r.width-cl, r.y+r.height}, BOX_COLOR, 3);
+        cv::line(frame, r.br(),               {r.x+r.width, r.y+r.height-cl}, BOX_COLOR, 3);
 
-        // Label
         std::string label = "STOP  " + std::to_string((int)(b.conf * 100)) + "%";
         int baseline = 0;
         cv::Size ts = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.55, 1, &baseline);
@@ -119,13 +108,9 @@ static void draw_boxes(cv::Mat& frame, const std::vector<DetectionState::BBox>& 
                     cv::FONT_HERSHEY_SIMPLEX, 0.55, LABEL_FG, 1, cv::LINE_AA);
     }
 
-    // HUD status text
-    std::string hud    = boxes.empty() ? "CLEAR" : "STOP SIGN DETECTED";
-    cv::Scalar  hud_c  = boxes.empty()
-                         ? cv::Scalar(80, 200, 80)
-                         : cv::Scalar(50, 52, 232);
-    cv::putText(frame, hud, {10, 28},
-                cv::FONT_HERSHEY_SIMPLEX, 0.7, hud_c, 2, cv::LINE_AA);
+    std::string hud   = boxes.empty() ? "CLEAR" : "STOP SIGN DETECTED";
+    cv::Scalar  hud_c = boxes.empty() ? cv::Scalar(80, 200, 80) : cv::Scalar(50, 52, 232);
+    cv::putText(frame, hud, {10, 28}, cv::FONT_HERSHEY_SIMPLEX, 0.7, hud_c, 2, cv::LINE_AA);
 }
 
 // ── Encode frame → JPEG → store in buffer ─────────────────────────────────────
@@ -133,7 +118,6 @@ static void encode_and_store(FrameBuffer& buf, cv::Mat& frame)
 {
     std::vector<uchar> jpeg;
     cv::imencode(".jpg", frame, jpeg, {cv::IMWRITE_JPEG_QUALITY, JPEG_QUALITY});
-
     std::lock_guard<std::mutex> lk(buf.mtx);
     buf.jpeg  = std::move(jpeg);
     buf.ready = true;
@@ -171,14 +155,14 @@ static const char* DASHBOARD_HTML = R"HTML(
     background:#0d1017;border-bottom:1px solid var(--border);
     font-size:.66rem;color:var(--muted);flex-shrink:0}
   .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;
-    background:var(--safe);box-shadow:0 0 6px var(--safe)}
-  .dot.err{background:var(--accent);box-shadow:0 0 6px var(--accent);
-    animation:blink 0.6s infinite}
+    transition:background .4s,box-shadow .4s}
+  .dot.live{background:var(--safe);box-shadow:0 0 6px var(--safe)}
+  .dot.waiting{background:#f0b429;box-shadow:0 0 6px #f0b429;animation:blink 1s infinite}
+  .dot.err{background:var(--accent);box-shadow:0 0 6px var(--accent)}
   @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 
   main{flex:1;display:grid;grid-template-columns:320px 1fr;overflow:hidden}
 
-  /* Left */
   .lp{border-right:1px solid var(--border);display:flex;flex-direction:column;
     align-items:center;gap:14px;padding:20px 16px;overflow-y:auto;
     scrollbar-width:thin;scrollbar-color:var(--border) transparent}
@@ -204,21 +188,18 @@ static const char* DASHBOARD_HTML = R"HTML(
   .sc.det .tx{fill:#fff}
   .sc.det .rg{stroke:rgba(255,255,255,.55)}
 
-  .sl{font-family:var(--head);font-size:2rem;letter-spacing:.12em;
+  .stl{font-family:var(--head);font-size:2rem;letter-spacing:.12em;
     color:var(--muted);transition:color .3s}
-  .sc.det .sl{color:var(--accent);text-shadow:0 0 18px rgba(232,52,26,.5)}
-  .ss2{font-size:.64rem;color:var(--muted);letter-spacing:.2em;text-transform:uppercase}
-  .sc.det .ss2{color:#e8341a99}
+  .sc.det .stl{color:var(--accent);text-shadow:0 0 18px rgba(232,52,26,.5)}
+  .sts{font-size:.64rem;color:var(--muted);letter-spacing:.2em;text-transform:uppercase}
+  .sc.det .sts{color:#e8341a99}
 
   .sr{display:grid;grid-template-columns:1fr 1fr;gap:10px;width:100%}
-  .sb{background:var(--panel);border:1px solid var(--border);
-    border-radius:4px;padding:12px 14px}
-  .sbl{font-size:.58rem;letter-spacing:.22em;color:var(--muted);
-    margin-bottom:4px;text-transform:uppercase}
+  .sb{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:12px 14px}
+  .sbl{font-size:.58rem;letter-spacing:.22em;color:var(--muted);margin-bottom:4px;text-transform:uppercase}
   .sbv{font-family:var(--head);font-size:1.6rem;color:var(--text)}
 
-  .lb{width:100%;background:var(--panel);border:1px solid var(--border);
-    border-radius:4px;overflow:hidden}
+  .lb{width:100%;background:var(--panel);border:1px solid var(--border);border-radius:4px;overflow:hidden}
   .lh{padding:7px 12px;border-bottom:1px solid var(--border);font-size:.58rem;
     letter-spacing:.22em;color:var(--muted);text-transform:uppercase;
     display:flex;justify-content:space-between;align-items:center}
@@ -233,13 +214,10 @@ static const char* DASHBOARD_HTML = R"HTML(
   @keyframes si{from{opacity:0;transform:translateX(-5px)}to{opacity:1;transform:translateX(0)}}
   #ll li .m{color:var(--accent)} #ll li .m.c{color:var(--safe)}
   #ll li .t{color:var(--muted);font-size:.6rem}
-  #ll:empty::after{content:'No events yet';display:block;padding:12px;
-    font-size:.64rem;color:var(--muted)}
+  #ll:empty::after{content:'No events yet';display:block;padding:12px;font-size:.64rem;color:var(--muted)}
 
-  /* Right */
   .rp{display:flex;flex-direction:column;overflow:hidden}
-  .ct{display:flex;border-bottom:1px solid var(--border);
-    background:var(--panel);flex-shrink:0}
+  .ct{display:flex;border-bottom:1px solid var(--border);background:var(--panel);flex-shrink:0}
   .tab{flex:1;padding:10px 0;font-family:var(--head);font-size:1rem;
     letter-spacing:.12em;text-align:center;cursor:pointer;color:var(--muted);
     background:transparent;border:none;border-right:1px solid var(--border);
@@ -250,12 +228,21 @@ static const char* DASHBOARD_HTML = R"HTML(
   .tab.active{color:var(--text);background:rgba(232,52,26,.05)}
   .tab.active::after{transform:scaleX(1)}
 
+  /* Canvas-based camera view — no <img> flickering */
   .cv{flex:1;background:#06080a;overflow:hidden;display:none;position:relative}
   .cv.active{display:flex;align-items:center;justify-content:center}
-  .cv img{width:100%;height:100%;object-fit:contain;display:block}
+  .cv canvas{width:100%;height:100%;object-fit:contain;display:block}
+
+  .placeholder{position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:10px;color:var(--muted)}
+  .placeholder .pi{font-size:2.5rem;opacity:.25}
+  .placeholder .pt{font-family:var(--head);font-size:1.2rem;letter-spacing:.15em;opacity:.3}
+  .placeholder .ps{font-size:.65rem;letter-spacing:.2em;opacity:.28}
+  .placeholder.hidden{display:none}
+
   .cl{position:absolute;top:10px;left:10px;background:rgba(10,12,15,.78);
     border:1px solid var(--border);border-radius:3px;padding:3px 10px;
-    font-size:.6rem;letter-spacing:.18em;color:var(--muted)}
+    font-size:.6rem;letter-spacing:.18em;color:var(--muted);pointer-events:none}
   .db{position:absolute;top:10px;right:10px;background:rgba(232,52,26,.15);
     border:1px solid var(--accent);border-radius:3px;padding:3px 12px;
     font-family:var(--head);font-size:.68rem;letter-spacing:.18em;
@@ -273,8 +260,8 @@ static const char* DASHBOARD_HTML = R"HTML(
   <div class="hm"><div id="clock">--:--:--</div><div>LIVE · MJPEG · JETSON</div></div>
 </header>
 <div class="sbar">
-  <div class="dot" id="sd"></div>
-  <span id="sl">CONNECTING…</span>
+  <div class="dot waiting" id="sd"></div>
+  <span id="sl">WAITING FOR FIRST FRAME…</span>
 </div>
 
 <main>
@@ -285,8 +272,8 @@ static const char* DASHBOARD_HTML = R"HTML(
         <polygon class="rg" points="60,18 100,18 142,60 142,100 100,142 60,142 18,100 18,60"/>
         <text class="tx" x="80" y="94" text-anchor="middle">STOP</text>
       </svg>
-      <div class="sl" id="stl">CLEAR</div>
-      <div class="ss2" id="sts">NO STOP SIGN DETECTED</div>
+      <div class="stl" id="stl">CLEAR</div>
+      <div class="sts" id="sts">NO STOP SIGN DETECTED</div>
     </div>
     <div class="sr">
       <div class="sb"><div class="sbl">Detections</div><div class="sbv" id="tc">0</div></div>
@@ -306,104 +293,203 @@ static const char* DASHBOARD_HTML = R"HTML(
       <button class="tab"        id="t2" onclick="sw('cam2')">CAM 2</button>
     </div>
     <div class="cv active" id="v1">
-      <img id="i1" src="/cam1" onerror="streamErr()"/>
+      <div class="placeholder" id="ph1">
+        <div class="pi">◉</div><div class="pt">CAMERA 1</div>
+        <div class="ps">AWAITING STREAM</div>
+      </div>
+      <canvas id="c1"></canvas>
       <div class="cl">CAM1 · MJPEG LIVE</div>
       <div class="db" id="b1">● STOP SIGN</div>
     </div>
     <div class="cv" id="v2">
-      <img id="i2" src="/cam2" onerror="streamErr()"/>
+      <div class="placeholder" id="ph2">
+        <div class="pi">◉</div><div class="pt">CAMERA 2</div>
+        <div class="ps">AWAITING STREAM</div>
+      </div>
+      <canvas id="c2"></canvas>
       <div class="cl">CAM2 · MJPEG LIVE</div>
       <div class="db" id="b2">● STOP SIGN</div>
     </div>
   </div>
 </main>
 <footer>
-  <span id="src">STREAM: connecting…</span>
-  <span id="fc">MSGS: 0</span>
+  <span id="src">STREAM: http://JETSON:8080/cam1  &amp;  /cam2</span>
+  <span id="fc">FRAMES: 0</span>
 </footer>
 
 <script>
-  // Clock
+  // ── Clock ──
   setInterval(()=>{
-    document.getElementById('clock').textContent=
+    document.getElementById('clock').textContent =
       new Date().toLocaleTimeString('en-CA',{hour12:false})
-  },1000)
+  }, 1000)
 
-  // Camera switch
-  function sw(cam){
+  // ── Camera toggle ──
+  function sw(cam) {
     ['cam1','cam2'].forEach((c,i)=>{
-      document.getElementById('v'+(i+1)).classList.toggle('active',c===cam)
-      document.getElementById('t'+(i+1)).classList.toggle('active',c===cam)
+      document.getElementById('v'+(i+1)).classList.toggle('active', c===cam)
+      document.getElementById('t'+(i+1)).classList.toggle('active', c===cam)
     })
   }
 
-  // Stream live indicator
-  document.getElementById('i1').onload=()=>{
-    document.getElementById('sd').className='dot'
-    document.getElementById('sl').textContent='LIVE · MJPEG STREAM ACTIVE'
-    document.getElementById('src').textContent=
-      'STREAM: '+location.hostname+':8080/cam1  &  /cam2'
-  }
-  function streamErr(){
-    document.getElementById('sd').className='dot err'
-    document.getElementById('sl').textContent='STREAM ERROR — check Jetson node'
+  // ── Status indicator — set once, never flicker ────────────────────────────
+  let streamLive = false
+  let totalFrames = 0
+
+  function setLive() {
+    if (streamLive) return          // only update once — prevents toggling
+    streamLive = true
+    document.getElementById('sd').className = 'dot live'
+    document.getElementById('sl').textContent = 'LIVE · MJPEG STREAM ACTIVE'
+    document.getElementById('src').textContent =
+      'STREAM: ' + location.hostname + ':8080/cam1  &  /cam2'
   }
 
-  // Detection state
-  let total=0, active=false, clearTimer=null, msgs=0
+  function setError(msg) {
+    // Only show error if we've never gone live — don't interrupt an active stream
+    if (!streamLive) {
+      document.getElementById('sd').className = 'dot err'
+      document.getElementById('sl').textContent = msg
+    }
+  }
 
-  async function poll(){
-    try{
-      const r=await fetch('/detections')
-      const d=await r.json()
-      msgs++
-      document.getElementById('fc').textContent='MSGS: '+msgs
-      update(d.detected, d.confidence)
-    }catch(e){}
-    setTimeout(poll,200)
+  // ── MJPEG → Canvas renderer ───────────────────────────────────────────────
+  // Replaces <img src="/camX"> which fires onload on EVERY frame causing
+  // the status bar to flicker. Instead we fetch the stream manually,
+  // scan for JPEG SOI/EOI markers, decode each blob via createObjectURL,
+  // draw to canvas, then immediately revoke. Full control, zero flicker.
+
+  async function startMjpegStream(url, canvasId, placeholderId) {
+    const canvas = document.getElementById(canvasId)
+    const ctx    = canvas.getContext('2d')
+    const ph     = document.getElementById(placeholderId)
+
+    while (true) {   // outer loop = auto-reconnect
+      try {
+        const resp = await fetch(url)
+        if (!resp.ok || !resp.body) throw new Error('bad response')
+
+        const reader = resp.body.getReader()
+        let buf = new Uint8Array(0)
+
+        while (true) {
+          const {value, done} = await reader.read()
+          if (done) break
+
+          // Append chunk to buffer
+          const tmp = new Uint8Array(buf.length + value.length)
+          tmp.set(buf)
+          tmp.set(value, buf.length)
+          buf = tmp
+
+          // Extract all complete JPEGs from buffer using SOI/EOI markers
+          while (true) {
+            // Find JPEG SOI (0xFF 0xD8)
+            let soi = -1
+            for (let i = 0; i < buf.length - 1; i++) {
+              if (buf[i] === 0xFF && buf[i+1] === 0xD8) { soi = i; break }
+            }
+            if (soi === -1) break
+
+            // Find JPEG EOI (0xFF 0xD9)
+            let eoi = -1
+            for (let i = soi + 2; i < buf.length - 1; i++) {
+              if (buf[i] === 0xFF && buf[i+1] === 0xD9) { eoi = i + 1; break }
+            }
+            if (eoi === -1) break   // incomplete JPEG — wait for more data
+
+            // Extract the complete JPEG
+            const jpeg = buf.slice(soi, eoi + 1)
+            buf = buf.slice(eoi + 1)
+
+            // Decode and draw via blob URL (fast, no base64 overhead)
+            const blob   = new Blob([jpeg], {type: 'image/jpeg'})
+            const objUrl = URL.createObjectURL(blob)
+            const img    = new Image()
+
+            img.onload = () => {
+              // Size canvas to container on first frame only
+              const container = canvas.parentElement
+              if (canvas.width !== container.clientWidth) {
+                canvas.width  = container.clientWidth
+                canvas.height = container.clientHeight
+              }
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+              URL.revokeObjectURL(objUrl)   // free memory immediately
+
+              ph.classList.add('hidden')    // hide placeholder
+              setLive()                     // mark stream as live (once only)
+
+              totalFrames++
+              document.getElementById('fc').textContent = 'FRAMES: ' + totalFrames
+            }
+            img.onerror = () => URL.revokeObjectURL(objUrl)
+            img.src = objUrl
+          }
+        }
+      } catch(e) {
+        setError('STREAM ERROR — retrying in 2s…')
+      }
+
+      await new Promise(r => setTimeout(r, 2000))  // wait before reconnecting
+    }
+  }
+
+  // Start both streams independently
+  startMjpegStream('/cam1', 'c1', 'ph1')
+  startMjpegStream('/cam2', 'c2', 'ph2')
+
+  // ── Detection polling (5 Hz) ──────────────────────────────────────────────
+  let total = 0, active = false, clearTimer = null
+
+  async function poll() {
+    try {
+      const r = await fetch('/detections')
+      const d = await r.json()
+      update(d.detected)
+    } catch(e) {}
+    setTimeout(poll, 200)
   }
   poll()
 
-  function update(det, conf){
-    const sc=document.getElementById('sc')
-    const stl=document.getElementById('stl')
-    const sts=document.getElementById('sts')
-    const b1=document.getElementById('b1')
-    const b2=document.getElementById('b2')
+  function update(det) {
+    const sc  = document.getElementById('sc')
+    const stl = document.getElementById('stl')
+    const sts = document.getElementById('sts')
 
-    b1.classList.toggle('on',det)
-    b2.classList.toggle('on',det)
+    document.getElementById('b1').classList.toggle('on', det)
+    document.getElementById('b2').classList.toggle('on', det)
 
-    if(det && !active){
-      active=true
+    if (det && !active) {
+      active = true
       total++
-      document.getElementById('tc').textContent=total
-      const now=new Date().toLocaleTimeString('en-CA',{hour12:false})
-      document.getElementById('ls').textContent=now
+      document.getElementById('tc').textContent = total
+      const now = new Date().toLocaleTimeString('en-CA',{hour12:false})
+      document.getElementById('ls').textContent = now
       sc.classList.add('det')
-      stl.textContent='STOP SIGN'
-      sts.textContent='DETECTED'
-      log('STOP SIGN DETECTED',now,false)
+      stl.textContent = 'STOP SIGN'
+      sts.textContent = 'DETECTED'
+      addLog('STOP SIGN DETECTED', now, false)
     }
 
-    if(det){
-      if(clearTimer) clearTimeout(clearTimer)
-      clearTimer=setTimeout(()=>{
-        active=false
+    if (det) {
+      if (clearTimer) clearTimeout(clearTimer)
+      clearTimer = setTimeout(()=>{
+        active = false
         sc.classList.remove('det')
-        stl.textContent='CLEAR'
-        sts.textContent='NO STOP SIGN DETECTED'
-        log('CLEAR',new Date().toLocaleTimeString('en-CA',{hour12:false}),true)
-      },2000)
+        stl.textContent = 'CLEAR'
+        sts.textContent = 'NO STOP SIGN DETECTED'
+        addLog('CLEAR', new Date().toLocaleTimeString('en-CA',{hour12:false}), true)
+      }, 2000)
     }
   }
 
-  function log(msg,time,clear){
-    const li=document.createElement('li')
-    li.innerHTML=`<span class="m ${clear?'c':''}">${msg}</span><span class="t">${time}</span>`
-    const l=document.getElementById('ll')
+  function addLog(msg, time, clear) {
+    const li = document.createElement('li')
+    li.innerHTML = `<span class="m ${clear?'c':''}">${msg}</span><span class="t">${time}</span>`
+    const l = document.getElementById('ll')
     l.prepend(li)
-    while(l.children.length>50)l.removeChild(l.lastChild)
+    while (l.children.length > 50) l.removeChild(l.lastChild)
   }
 </script>
 </body>
@@ -442,9 +528,10 @@ static void send_str(int fd, const std::string& status,
 // ── MJPEG stream per-connection ───────────────────────────────────────────────
 static void serve_mjpeg(int fd, FrameBuffer& buf)
 {
+    // Named boundary so the JS SOI/EOI scanner has clean JPEG data to work with
     const char* hdr =
         "HTTP/1.1 200 OK\r\n"
-        "Content-Type: multipart/x-mixed-replace; boundary=--f\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=--aavframe\r\n"
         "Cache-Control: no-cache\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Connection: keep-alive\r\n\r\n";
@@ -464,8 +551,9 @@ static void serve_mjpeg(int fd, FrameBuffer& buf)
         }
 
         std::ostringstream ph;
-        ph << "--f\r\nContent-Type: image/jpeg\r\nContent-Length: "
-           << frame.size() << "\r\n\r\n";
+        ph << "--aavframe\r\n"
+           << "Content-Type: image/jpeg\r\n"
+           << "Content-Length: " << frame.size() << "\r\n\r\n";
         auto phs = ph.str();
 
         if (send(fd, phs.c_str(), phs.size(), MSG_NOSIGNAL) < 0) break;
@@ -525,7 +613,6 @@ class WebDashboardNode : public rclcpp::Node
 public:
     WebDashboardNode() : Node("web_dashboard_node")
     {
-        // Subscribers
         sub_detected_ = create_subscription<std_msgs::msg::Bool>(
             "/aav/stop_sign_detected", 10,
             [this](const std_msgs::msg::Bool::SharedPtr msg) {
@@ -557,7 +644,6 @@ public:
                 g_det.boxes = std::move(boxes);
             });
 
-        // Queue depth 1 — always use latest frame, drop old ones
         auto qos = rclcpp::SensorDataQoS();
 
         sub_cam1_ = create_subscription<sensor_msgs::msg::Image>(
@@ -572,7 +658,6 @@ public:
                 process_frame(msg, g_cam2);
             });
 
-        // Start HTTP server
         http_thread_ = std::thread(http_server);
         http_thread_.detach();
 
@@ -585,28 +670,22 @@ private:
                        FrameBuffer& buf)
     {
         try {
-            // Convert ROS image to OpenCV
             cv::Mat frame = cv_bridge::toCvShare(msg, "bgr8")->image.clone();
-
-            // Copy latest bboxes and draw them
             {
                 std::lock_guard<std::mutex> lk(g_det.mtx);
                 draw_boxes(frame, g_det.boxes);
             }
-
-            // Encode to JPEG and store for MJPEG stream
             encode_and_store(buf, frame);
-
         } catch (const cv_bridge::Exception& e) {
             RCLCPP_WARN(get_logger(), "cv_bridge error: %s", e.what());
         }
     }
 
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr             sub_detected_;
-    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr          sub_confidence_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr                sub_detected_;
+    rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr             sub_confidence_;
     rclcpp::Subscription<vision_msgs::msg::Detection2DArray>::SharedPtr sub_detections_;
-    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr         sub_cam1_;
-    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr         sub_cam2_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr            sub_cam1_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr            sub_cam2_;
 
     std::thread http_thread_;
 };
