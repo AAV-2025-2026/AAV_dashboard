@@ -6,6 +6,7 @@
  * - subscribes to per-camera stop sign + pedestrian detections
  * - overlays detections only on the matching camera
  * - shows CAM1 and CAM2 side by side
+ * - restores stop sign alert card + event log
  * - serves MJPEG dashboard over HTTP
  *
  * Camera topics:
@@ -90,6 +91,17 @@ static std::vector<BBox> g_cam2_stop_boxes;
 static std::vector<BBox> g_cam2_ped_boxes;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Dashboard state for stop sign alert card / logs
+// ─────────────────────────────────────────────────────────────────────────────
+struct DashboardState {
+    std::mutex mtx;
+    bool cam1_stop_active = false;
+    float cam1_stop_confidence = 0.0f;
+};
+
+static DashboardState g_dash_state;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 static void encode_and_store(FrameBuffer& buf, cv::Mat& frame)
@@ -111,8 +123,8 @@ static std::string pretty_label(const std::string& cls)
 
 static cv::Scalar class_color(const std::string& cls)
 {
-    if (cls == "stop_sign")  return cv::Scalar(50, 52, 232);   // red-ish
-    if (cls == "pedestrian") return cv::Scalar(0, 165, 255);   // orange
+    if (cls == "stop_sign")  return cv::Scalar(50, 52, 232);
+    if (cls == "pedestrian") return cv::Scalar(0, 165, 255);
     return cv::Scalar(0, 255, 255);
 }
 
@@ -160,6 +172,26 @@ static void rebuild_cam2_overlay()
 {
     std::lock_guard<std::mutex> lk(g_cam2_det_mtx);
     rebuild_overlay(g_cam2_overlay, g_cam2_stop_boxes, g_cam2_ped_boxes);
+}
+
+static void update_dashboard_stop_state_from_cam1()
+{
+    bool active = false;
+    float max_conf = 0.0f;
+
+    {
+        std::lock_guard<std::mutex> lk(g_cam1_det_mtx);
+        active = !g_cam1_stop_boxes.empty();
+        for (const auto& b : g_cam1_stop_boxes) {
+            max_conf = std::max(max_conf, b.conf);
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(g_dash_state.mtx);
+        g_dash_state.cam1_stop_active = active;
+        g_dash_state.cam1_stop_confidence = max_conf;
+    }
 }
 
 static void draw_boxes(cv::Mat& frame, const std::vector<BBox>& boxes)
@@ -229,7 +261,7 @@ static const char* DASHBOARD_HTML = R"HTML(
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Bebas+Neue&display=swap" rel="stylesheet"/>
 <style>
   :root{
-    --bg:#0a0c0f;--panel:#111418;--border:#1e2430;
+    --bg:#0a0c0f;--panel:#111418;--border:#1e2430;--accent:#e8341a;
     --text:#c8d0dc;--muted:#4a5568;--safe:#1adb6e;
     --mono:'Share Tech Mono',monospace;--head:'Bebas Neue',sans-serif
   }
@@ -238,13 +270,20 @@ static const char* DASHBOARD_HTML = R"HTML(
     background:var(--bg);color:var(--text);font-family:var(--mono);
     height:100vh;display:flex;flex-direction:column;overflow:hidden
   }
+  body::after{
+    content:'';position:fixed;inset:0;pointer-events:none;z-index:999;
+    background:repeating-linear-gradient(0deg,transparent,transparent 2px,
+    rgba(0,0,0,0.07) 2px,rgba(0,0,0,0.07) 4px)
+  }
+
   header{
     display:flex;align-items:center;justify-content:space-between;
     padding:14px 24px;border-bottom:1px solid var(--border);background:var(--panel)
   }
   .logo{font-family:var(--head);font-size:1.8rem;letter-spacing:.15em;color:#fff}
-  .logo span{color:#e8341a}
+  .logo span{color:var(--accent)}
   .hm{font-size:.68rem;color:var(--muted);text-align:right;line-height:1.9}
+  #clock{color:var(--text)}
 
   .sbar{
     display:flex;align-items:center;gap:8px;padding:5px 24px;background:#0d1017;
@@ -252,24 +291,81 @@ static const char* DASHBOARD_HTML = R"HTML(
   }
   .dot{width:7px;height:7px;border-radius:50%}
   .dot.live{background:var(--safe);box-shadow:0 0 6px var(--safe)}
-  .dot.waiting{background:#f0b429;box-shadow:0 0 6px #f0b429}
+  .dot.waiting{background:#f0b429;box-shadow:0 0 6px #f0b429;animation:blink 1s infinite}
   .dot.err{background:#e8341a;box-shadow:0 0 6px #e8341a}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 
-  main{flex:1;display:flex;flex-direction:column;overflow:hidden}
-  .topbar{
-    display:grid;grid-template-columns:1fr 1fr;gap:12px;
-    padding:12px;border-bottom:1px solid var(--border);background:var(--panel)
-  }
-  .status{
-    border:1px solid var(--border);border-radius:4px;padding:10px 12px;background:#0d1017
-  }
-  .status .title{
-    font-size:.65rem;letter-spacing:.18em;color:var(--muted);margin-bottom:6px
-  }
-  .status .value{
-    font-family:var(--head);font-size:1.3rem;letter-spacing:.08em
+  main{flex:1;display:grid;grid-template-columns:320px 1fr;overflow:hidden}
+
+  .lp{
+    border-right:1px solid var(--border);display:flex;flex-direction:column;
+    gap:14px;padding:20px 16px;overflow-y:auto
   }
 
+  .sc{
+    width:100%;background:var(--panel);border:1px solid var(--border);
+    border-radius:4px;padding:26px 20px;display:flex;flex-direction:column;
+    align-items:center;gap:13px;position:relative;overflow:hidden;transition:border-color .3s
+  }
+  .sc::before{
+    content:'';position:absolute;inset:0;opacity:0;transition:opacity .5s;
+    pointer-events:none;border-radius:4px
+  }
+  .sc.det{border-color:var(--accent);animation:pb .8s ease-out}
+  .sc.det::before{
+    background:radial-gradient(ellipse at center, rgba(232,52,26,.13) 0%, transparent 70%);
+    opacity:1
+  }
+  @keyframes pb{
+    0%{box-shadow:0 0 0 0 rgba(232,52,26,.6)}
+    100%{box-shadow:0 0 0 22px rgba(232,52,26,0)}
+  }
+
+  .ss{width:108px;height:108px;transition:filter .4s,transform .3s}
+  .ss .oc{fill:#2a3040;stroke:var(--muted);stroke-width:3;transition:fill .4s,stroke .4s}
+  .ss .rg{fill:none;stroke:var(--muted);stroke-width:4;transition:stroke .4s}
+  .ss .tx{fill:var(--muted);font-family:var(--head);font-size:36px;letter-spacing:4px;transition:fill .4s}
+  .sc.det .ss{filter:drop-shadow(0 0 14px rgba(232,52,26,.7));transform:scale(1.05)}
+  .sc.det .ss .oc{fill:var(--accent);stroke:#ff6b55}
+  .sc.det .ss .tx{fill:#fff}
+  .sc.det .ss .rg{stroke:rgba(255,255,255,.55)}
+
+  .stl{font-family:var(--head);font-size:2rem;letter-spacing:.12em;color:var(--muted);transition:color .3s}
+  .sc.det .stl{color:var(--accent);text-shadow:0 0 18px rgba(232,52,26,.5)}
+  .sts{font-size:.64rem;color:var(--muted);letter-spacing:.2em;text-transform:uppercase}
+  .sc.det .sts{color:#e8341a99}
+
+  .sr{display:grid;grid-template-columns:1fr 1fr;gap:10px;width:100%}
+  .sb{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:12px 14px}
+  .sbl{font-size:.58rem;letter-spacing:.22em;color:var(--muted);margin-bottom:4px;text-transform:uppercase}
+  .sbv{font-family:var(--head);font-size:1.6rem;color:var(--text)}
+
+  .lb{width:100%;background:var(--panel);border:1px solid var(--border);border-radius:4px;overflow:hidden}
+  .lh{
+    padding:7px 12px;border-bottom:1px solid var(--border);font-size:.58rem;
+    letter-spacing:.22em;color:var(--muted);text-transform:uppercase;
+    display:flex;justify-content:space-between;align-items:center
+  }
+  .lh button{
+    background:none;border:1px solid var(--border);color:var(--muted);
+    font-family:var(--mono);font-size:.55rem;padding:2px 8px;cursor:pointer
+  }
+  .lh button:hover{color:var(--text);border-color:var(--text)}
+  #ll{
+    list-style:none;max-height:160px;overflow-y:auto
+  }
+  #ll li{
+    padding:6px 12px;font-size:.64rem;border-bottom:1px solid #1a1f28;
+    display:flex;justify-content:space-between
+  }
+  #ll li .m{color:var(--accent)}
+  #ll li .m.c{color:var(--safe)}
+  #ll li .t{color:var(--muted);font-size:.6rem}
+  #ll:empty::after{
+    content:'No events yet';display:block;padding:12px;font-size:.64rem;color:var(--muted)
+  }
+
+  .rp{display:flex;flex-direction:column;overflow:hidden}
   .cams{
     flex:1;display:grid;grid-template-columns:1fr 1fr;gap:12px;
     padding:12px;overflow:hidden
@@ -283,12 +379,23 @@ static const char* DASHBOARD_HTML = R"HTML(
     position:absolute;inset:0;display:flex;flex-direction:column;
     align-items:center;justify-content:center;gap:10px;color:var(--muted)
   }
+  .placeholder .pi{font-size:2.5rem;opacity:.25}
+  .placeholder .pt{font-family:var(--head);font-size:1.2rem;letter-spacing:.15em;opacity:.3}
+  .placeholder .ps{font-size:.65rem;letter-spacing:.2em;opacity:.28}
   .placeholder.hidden{display:none}
+
   .cl{
     position:absolute;top:10px;left:10px;background:rgba(10,12,15,.78);
     border:1px solid var(--border);border-radius:3px;padding:3px 10px;
     font-size:.6rem;letter-spacing:.18em;color:var(--muted)
   }
+  .db{
+    position:absolute;top:10px;right:10px;background:rgba(232,52,26,.15);
+    border:1px solid var(--accent);border-radius:3px;padding:3px 12px;
+    font-family:var(--head);font-size:.68rem;letter-spacing:.18em;
+    color:var(--accent);opacity:0;transition:opacity .3s;animation:blink .7s infinite
+  }
+  .db.on{opacity:1}
 
   footer{
     padding:8px 24px;border-top:1px solid var(--border);font-size:.6rem;color:var(--muted);
@@ -311,34 +418,59 @@ static const char* DASHBOARD_HTML = R"HTML(
 </div>
 
 <main>
-  <div class="topbar">
-    <div class="status">
-      <div class="title">CAM 1 STATUS</div>
-      <div class="value" id="cam1_status">LIVE</div>
+  <div class="lp">
+    <div class="sc" id="sc">
+      <svg class="ss" viewBox="0 0 160 160">
+        <polygon class="oc" points="56,10 104,10 150,56 150,104 104,150 56,150 10,104 10,56"/>
+        <polygon class="rg" points="60,18 100,18 142,60 142,100 100,142 60,142 18,100 18,60"/>
+        <text class="tx" x="80" y="94" text-anchor="middle">STOP</text>
+      </svg>
+      <div class="stl" id="stl">CLEAR</div>
+      <div class="sts" id="sts">NO STOP SIGN DETECTED</div>
     </div>
-    <div class="status">
-      <div class="title">CAM 2 STATUS</div>
-      <div class="value" id="cam2_status">LIVE</div>
+
+    <div class="sr">
+      <div class="sb">
+        <div class="sbl">Detections</div>
+        <div class="sbv" id="tc">0</div>
+      </div>
+      <div class="sb">
+        <div class="sbl">Last Seen</div>
+        <div class="sbv" id="ls" style="font-size:.85rem;padding-top:6px">—</div>
+      </div>
+    </div>
+
+    <div class="lb">
+      <div class="lh">
+        <span>Event Log</span>
+        <button onclick="document.getElementById('ll').innerHTML=''">CLEAR</button>
+      </div>
+      <ul id="ll"></ul>
     </div>
   </div>
 
-  <div class="cams">
-    <div class="cam">
-      <div class="placeholder" id="ph1">
-        <div>CAMERA 1</div>
-        <div>AWAITING STREAM</div>
+  <div class="rp">
+    <div class="cams">
+      <div class="cam">
+        <div class="placeholder" id="ph1">
+          <div class="pi">◉</div>
+          <div class="pt">CAMERA 1</div>
+          <div class="ps">AWAITING STREAM</div>
+        </div>
+        <canvas id="c1"></canvas>
+        <div class="cl">CAM1 · MJPEG LIVE</div>
+        <div class="db" id="b1">● STOP SIGN</div>
       </div>
-      <canvas id="c1"></canvas>
-      <div class="cl">CAM1 · MJPEG LIVE</div>
-    </div>
 
-    <div class="cam">
-      <div class="placeholder" id="ph2">
-        <div>CAMERA 2</div>
-        <div>AWAITING STREAM</div>
+      <div class="cam">
+        <div class="placeholder" id="ph2">
+          <div class="pi">◉</div>
+          <div class="pt">CAMERA 2</div>
+          <div class="ps">AWAITING STREAM</div>
+        </div>
+        <canvas id="c2"></canvas>
+        <div class="cl">CAM2 · MJPEG LIVE</div>
       </div>
-      <canvas id="c2"></canvas>
-      <div class="cl">CAM2 · MJPEG LIVE</div>
     </div>
   </div>
 </main>
@@ -443,6 +575,60 @@ static const char* DASHBOARD_HTML = R"HTML(
 
   startMjpegStream('/cam1', 'c1', 'ph1')
   startMjpegStream('/cam2', 'c2', 'ph2')
+
+  let total = 0
+  let active = false
+  let clearTimer = null
+
+  async function pollDashboardState() {
+    try {
+      const r = await fetch('/dashboard_state')
+      const d = await r.json()
+      updateStopState(d.cam1_stop_active)
+    } catch (e) {}
+    setTimeout(pollDashboardState, 200)
+  }
+  pollDashboardState()
+
+  function updateStopState(det) {
+    const sc = document.getElementById('sc')
+    const stl = document.getElementById('stl')
+    const sts = document.getElementById('sts')
+    const badge = document.getElementById('b1')
+
+    badge.classList.toggle('on', det)
+
+    if (det && !active) {
+      active = true
+      total++
+      document.getElementById('tc').textContent = total
+      const now = new Date().toLocaleTimeString('en-CA', {hour12:false})
+      document.getElementById('ls').textContent = now
+      sc.classList.add('det')
+      stl.textContent = 'STOP SIGN'
+      sts.textContent = 'DETECTED'
+      addLog('STOP SIGN DETECTED (CAM1)', now, false)
+    }
+
+    if (det) {
+      if (clearTimer) clearTimeout(clearTimer)
+      clearTimer = setTimeout(() => {
+        active = false
+        sc.classList.remove('det')
+        stl.textContent = 'CLEAR'
+        sts.textContent = 'NO STOP SIGN DETECTED'
+        addLog('CLEAR', new Date().toLocaleTimeString('en-CA', {hour12:false}), true)
+      }, 2000)
+    }
+  }
+
+  function addLog(msg, time, clear) {
+    const li = document.createElement('li')
+    li.innerHTML = `<span class="m ${clear ? 'c' : ''}">${msg}</span><span class="t">${time}</span>`
+    const l = document.getElementById('ll')
+    l.prepend(li)
+    while (l.children.length > 50) l.removeChild(l.lastChild)
+  }
 </script>
 </body>
 </html>
@@ -547,6 +733,24 @@ static void http_server()
                 serve_mjpeg(client, g_cam1);
             } else if (path == "/cam2") {
                 serve_mjpeg(client, g_cam2);
+            } else if (path == "/dashboard_state") {
+                bool stop_active = false;
+                float stop_conf = 0.0f;
+
+                {
+                    std::lock_guard<std::mutex> lk(g_dash_state.mtx);
+                    stop_active = g_dash_state.cam1_stop_active;
+                    stop_conf = g_dash_state.cam1_stop_confidence;
+                }
+
+                std::ostringstream json;
+                json << "{"
+                     << "\"cam1_stop_active\":" << (stop_active ? "true" : "false") << ","
+                     << "\"cam1_stop_confidence\":" << stop_conf
+                     << "}";
+
+                send_str(client, "200 OK", "application/json", json.str());
+                close(client);
             } else {
                 send_str(client, "200 OK", "text/html", DASHBOARD_HTML);
                 close(client);
@@ -565,7 +769,6 @@ public:
     {
         auto qos = rclcpp::SensorDataQoS();
 
-        // Camera streams
         sub_cam1_ = create_subscription<sensor_msgs::msg::Image>(
             "/camera/cam1/image_raw", qos,
             [this](const sensor_msgs::msg::Image::SharedPtr msg) {
@@ -578,7 +781,6 @@ public:
                 process_frame(msg, g_cam2, g_cam2_overlay);
             });
 
-        // CAM1 stop sign
         sub_cam1_stop_ = create_subscription<vision_msgs::msg::Detection2DArray>(
             "/aav/cam1/stop_sign_detections", 10,
             [this](const vision_msgs::msg::Detection2DArray::SharedPtr msg) {
@@ -588,9 +790,9 @@ public:
                     g_cam1_stop_boxes = std::move(boxes);
                 }
                 rebuild_cam1_overlay();
+                update_dashboard_stop_state_from_cam1();
             });
 
-        // CAM1 pedestrian
         sub_cam1_ped_ = create_subscription<vision_msgs::msg::Detection2DArray>(
             "/aav/cam1/pedestrian_detections", 10,
             [this](const vision_msgs::msg::Detection2DArray::SharedPtr msg) {
@@ -602,7 +804,6 @@ public:
                 rebuild_cam1_overlay();
             });
 
-        // CAM2 stop sign
         sub_cam2_stop_ = create_subscription<vision_msgs::msg::Detection2DArray>(
             "/aav/cam2/stop_sign_detections", 10,
             [this](const vision_msgs::msg::Detection2DArray::SharedPtr msg) {
@@ -614,7 +815,6 @@ public:
                 rebuild_cam2_overlay();
             });
 
-        // CAM2 pedestrian
         sub_cam2_ped_ = create_subscription<vision_msgs::msg::Detection2DArray>(
             "/aav/cam2/pedestrian_detections", 10,
             [this](const vision_msgs::msg::Detection2DArray::SharedPtr msg) {
@@ -630,10 +830,7 @@ public:
         http_thread_.detach();
 
         RCLCPP_INFO(get_logger(), "Web dashboard running at http://<JETSON_IP>:%d", HTTP_PORT);
-        RCLCPP_INFO(get_logger(), "CAM1 image topic: /camera/cam1/image_raw");
-        RCLCPP_INFO(get_logger(), "CAM2 image topic: /camera/cam2/image_raw");
-        RCLCPP_INFO(get_logger(), "CAM1 detections: /aav/cam1/stop_sign_detections, /aav/cam1/pedestrian_detections");
-        RCLCPP_INFO(get_logger(), "CAM2 detections: /aav/cam2/stop_sign_detections, /aav/cam2/pedestrian_detections");
+        RCLCPP_INFO(get_logger(), "CAM1 detections drive stop-sign alert card and logs");
     }
 
 private:
@@ -668,9 +865,6 @@ private:
     std::thread http_thread_;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// main
-// ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
